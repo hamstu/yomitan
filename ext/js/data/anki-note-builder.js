@@ -461,7 +461,7 @@ export class AnkiNoteBuilder {
         }
 
         // Inject media
-        const popupSelectionText = injectPopupSelectionText ? this._getPopupSelectionText() : null;
+        const popupSelectionText = injectPopupSelectionText ? (mediaOptions.popupSelectionText ?? this._getPopupSelectionText()) : null;
         const injectedMedia = await this._api.injectAnkiNoteMedia(
             timestamp,
             dictionaryEntryDetails,

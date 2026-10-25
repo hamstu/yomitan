@@ -48,6 +48,18 @@ export type ankiCardFormatsInput = {
     profileIndex?: number;
 };
 
+export type addAnkiNoteInput = {
+    text: string;
+    cardFormatIndex?: number;
+    entryIndex?: number;
+    sentence?: string;
+    sentenceOffset?: number;
+    url?: string;
+    documentTitle?: string;
+    screenshot?: string;
+    popupSelectionText?: string;
+};
+
 export type remoteVersionResponse = {
     version: number;
 };

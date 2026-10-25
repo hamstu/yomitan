@@ -40,7 +40,7 @@ import {distributeFuriganaInflected, isCodePointJapanese, convertKatakanaToHirag
 import {getLanguageSummaries, isTextLookupWorthy} from '../language/languages.js';
 import {Translator} from '../language/translator.js';
 import {AudioDownloader} from '../media/audio-downloader.js';
-import {getFileExtensionFromAudioMediaType, getFileExtensionFromImageMediaType} from '../media/media-util.js';
+import {getDataUrlInfo, getFileExtensionFromAudioMediaType, getFileExtensionFromImageMediaType} from '../media/media-util.js';
 import {ClipboardReaderProxy, DictionaryDatabaseProxy, OffscreenProxy, TranslatorProxy} from './offscreen-proxy.js';
 import {createSchema, normalizeContext} from './profile-conditions-util.js';
 import {RequestBuilder} from './request-builder.js';
@@ -210,7 +210,7 @@ export class Backend {
         ]));
 
         /** @type {YomitanApi} */
-        this._yomitanApi = new YomitanApi(this._apiMap, this._offscreen);
+        this._yomitanApi = new YomitanApi(this._apiMap, this._offscreen, this._anki);
         /** @type {CacheMap<string, {originalTextLength: number, textSegments: import('api').ParseTextSegment[]}>} */
         this._textParseCache = new CacheMap(10000, 3600000); // 1 hour idle time, ~32MB per 1000 entries for Japanese
     }
@@ -2540,7 +2540,7 @@ export class Backend {
         const {tabId, frameId, format, quality} = details;
         const dataUrl = await this._getScreenshot(tabId, frameId, format, quality);
 
-        const {mediaType, data} = this._getDataUrlInfo(dataUrl);
+        const {mediaType, data} = getDataUrlInfo(dataUrl);
         const extension = getFileExtensionFromImageMediaType(mediaType);
         if (extension === null) {
             throw new Error('Unknown media type for screenshot image');
@@ -2561,7 +2561,7 @@ export class Backend {
             return null;
         }
 
-        const {mediaType, data} = this._getDataUrlInfo(dataUrl);
+        const {mediaType, data} = getDataUrlInfo(dataUrl);
         const extension = getFileExtensionFromImageMediaType(mediaType);
         if (extension === null) {
             throw new Error('Unknown media type for clipboard image');
@@ -2693,26 +2693,6 @@ export class Backend {
             }
         }
         return error;
-    }
-
-    /**
-     * @param {string} dataUrl
-     * @returns {{mediaType: string, data: string}}
-     * @throws {Error}
-     */
-    _getDataUrlInfo(dataUrl) {
-        const match = /^data:([^,]*?)(;base64)?,/.exec(dataUrl);
-        if (match === null) {
-            throw new Error('Invalid data URL');
-        }
-
-        let mediaType = match[1];
-        if (mediaType.length === 0) { mediaType = 'text/plain'; }
-
-        let data = dataUrl.substring(match[0].length);
-        if (typeof match[2] === 'undefined') { data = btoa(data); }
-
-        return {mediaType, data};
     }
 
     /**

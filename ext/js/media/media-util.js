@@ -133,3 +133,23 @@ export function getFileExtensionFromAudioMediaType(mediaType) {
             return null;
     }
 }
+
+/**
+ * @param {string} dataUrl
+ * @returns {{mediaType: string, data: string}}
+ * @throws {Error}
+ */
+export function getDataUrlInfo(dataUrl) {
+    const match = /^data:([^,]*?)(;base64)?,/.exec(dataUrl);
+    if (match === null) {
+        throw new Error('Invalid data URL');
+    }
+
+    let mediaType = match[1];
+    if (mediaType.length === 0) { mediaType = 'text/plain'; }
+
+    let data = dataUrl.substring(match[0].length);
+    if (typeof match[2] === 'undefined') { data = btoa(data); }
+
+    return {mediaType, data};
+}

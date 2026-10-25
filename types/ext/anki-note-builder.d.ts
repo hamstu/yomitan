@@ -108,6 +108,7 @@ export type MediaOptions = {
         optionsContext: Settings.OptionsContext;
         scanLength: number;
     };
+    popupSelectionText?: string;
 };
 
 export type TextFuriganaDetails = {

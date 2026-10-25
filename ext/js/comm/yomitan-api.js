@@ -18,18 +18,20 @@
 import {parseHTML} from '../../lib/linkedom.js';
 import {OffscreenProxy} from '../background/offscreen-proxy.js';
 import {RequestBuilder} from '../background/request-builder.js';
+import {AnkiConnect} from './anki-connect.js';
 import {invokeApiMapHandler} from '../core/api-map.js';
 import {EventListenerCollection} from '../core/event-listener-collection.js';
 import {ExtensionError} from '../core/extension-error.js';
 import {parseJson, readResponseJson} from '../core/json.js';
 import {log} from '../core/log.js';
 import {toError} from '../core/to-error.js';
-import {createFuriganaHtml, createFuriganaPlain} from '../data/anki-note-builder.js';
+import {AnkiNoteBuilder, createFuriganaHtml, createFuriganaPlain} from '../data/anki-note-builder.js';
 import {getDynamicTemplates} from '../data/anki-template-util.js';
-import {mediaFileNameHashOrTimestamp} from '../data/anki-util.js';
+import {generateAnkiNoteMediaFileName, mediaFileNameHashOrTimestamp} from '../data/anki-util.js';
+import {arrayBufferToBase64} from '../data/array-buffer-util.js';
 import {getLanguageSummaries} from '../language/languages.js';
 import {AudioDownloader} from '../media/audio-downloader.js';
-import {getFileExtensionFromAudioMediaType, getFileExtensionFromImageMediaType} from '../media/media-util.js';
+import {getDataUrlInfo, getFileExtensionFromAudioMediaType, getFileExtensionFromImageMediaType} from '../media/media-util.js';
 import {getDictionaryEntryMedia} from '../pages/settings/anki-deck-generator-controller.js';
 import {AnkiTemplateRenderer} from '../templates/anki-template-renderer.js';
 
@@ -38,8 +40,9 @@ export class YomitanApi {
     /**
      * @param {import('api').ApiMap} apiMap
      * @param {OffscreenProxy?} offscreen
+     * @param {AnkiConnect} anki
      */
-    constructor(apiMap, offscreen) {
+    constructor(apiMap, offscreen, anki) {
         /** @type {?chrome.runtime.Port} */
         this._port = null;
         /** @type {EventListenerCollection} */
@@ -62,6 +65,8 @@ export class YomitanApi {
         this._audioDownloader = new AudioDownloader(this._requestBuilder);
         /** @type {OffscreenProxy?} */
         this._offscreen = offscreen;
+        /** @type {AnkiConnect} */
+        this._anki = anki;
     }
 
     /**
@@ -282,6 +287,28 @@ export class YomitanApi {
                         result = profileOptions.anki.cardFormats;
                         break;
                     }
+                    case 'addAnkiNote': {
+                        /** @type {import('yomitan-api.js').addAnkiNoteInput} */
+                        // @ts-expect-error - Allow this to error
+                        const {text, cardFormatIndex = 0, entryIndex = 0, sentence = text, sentenceOffset = 0, url = '', documentTitle = '', screenshot = null, popupSelectionText = ''} = parsedBody;
+                        if (typeof text !== 'string') {
+                            throw new Error('Invalid input for addAnkiNote, expected "text" to be a string but got ' + typeof text);
+                        }
+                        const profileOptions = optionsFull.profiles[optionsFull.profileCurrent].options;
+                        const context = {
+                            url: url,
+                            documentTitle: documentTitle,
+                            query: text,
+                            fullQuery: text,
+                            sentence: {
+                                text: sentence,
+                                offset: sentenceOffset,
+                            },
+                        };
+                        const noteId = await this._addAnkiNote(text, cardFormatIndex, entryIndex, context, screenshot, popupSelectionText, profileOptions, optionsFull.profileCurrent);
+                        result = {noteId: noteId};
+                        break;
+                    }
                     default:
                         statusCode = 400;
                 }
@@ -304,6 +331,134 @@ export class YomitanApi {
         const dictionaryInfo = await this._invoke('getDictionaryInfo', void 0);
         const dynamicTemplates = getDynamicTemplates(options, dictionaryInfo);
         return staticTemplates + '\n' + dynamicTemplates;
+    }
+
+    /**
+     * @param {string} text
+     * @param {number} cardFormatIndex
+     * @param {number} entryIndex
+     * @param {import('anki-templates-internal').Context} context
+     * @param {?string} screenshot
+     * @param {string} popupSelectionText
+     * @param {import('settings').ProfileOptions} options
+     * @param {number} profileIndex
+     * @returns {Promise<number>}
+     */
+    async _addAnkiNote(text, cardFormatIndex, entryIndex, context, screenshot, popupSelectionText, options, profileIndex) {
+        if (!options.anki.enable) {
+            throw new Error('Anki integration is not enabled');
+        }
+        const cardFormat = options.anki.cardFormats[cardFormatIndex];
+        if (typeof cardFormat === 'undefined') {
+            throw new Error('Invalid input for addAnkiNote, expected "cardFormatIndex" to be a valid card format index but got ' + cardFormatIndex);
+        }
+        const dictionaryEntry = (await this._getDictionaryEntries(text, cardFormat.type, profileIndex))[entryIndex];
+        if (typeof dictionaryEntry === 'undefined') {
+            throw new Error('Invalid input for addAnkiNote, no dictionary entry found at "entryIndex" ' + entryIndex);
+        }
+
+        // @ts-expect-error - `parseHTML` can return `null` but this input has been validated to not be `null`
+        const domlessDocument = parseHTML('').document;
+        // @ts-expect-error - `parseHTML` can return `null` but this input has been validated to not be `null`
+        const domlessWindow = parseHTML('').window;
+        const ankiTemplateRenderer = new AnkiTemplateRenderer(domlessDocument, domlessWindow);
+        await ankiTemplateRenderer.prepare();
+        /** @type {?string} */
+        let screenshotFileName = null;
+        const ankiNoteBuilder = new AnkiNoteBuilder({
+            injectAnkiNoteMedia: async (timestamp, definitionDetails, audioDetails, screenshotDetails, clipboardDetails, dictionaryMediaDetails) => ({
+                ...await this._invoke('injectAnkiNoteMedia', {timestamp, definitionDetails, audioDetails, screenshotDetails, clipboardDetails, dictionaryMediaDetails}),
+                screenshotFileName,
+            }),
+            parseText: (parseTextInput, optionsContext, scanLength, useInternalParser, useMecabParser, useAllFrequencyDictionaries) => this._invoke('parseText', {text: parseTextInput, optionsContext, scanLength, useInternalParser, useMecabParser, useAllFrequencyDictionaries}),
+        }, ankiTemplateRenderer.templateRenderer);
+
+        const idleTimeout = (Number.isFinite(options.anki.downloadTimeout) && options.anki.downloadTimeout > 0 ? options.anki.downloadTimeout : null);
+        const languageSummary = getLanguageSummaries().find(({iso}) => iso === options.general.language);
+        /** @type {?import('anki-note-builder').AudioMediaOptions} */
+        const audioOptions = typeof languageSummary !== 'undefined' ?
+            {
+                sources: options.audio.sources,
+                preferredAudioIndex: null,
+                idleTimeout,
+                languageSummary,
+                enableDefaultAudioSources: options.audio.enableDefaultAudioSources,
+            } :
+            null;
+        /** @type {import('anki-note-builder').CreateNoteDetails} */
+        const details = {
+            dictionaryEntry,
+            cardFormat,
+            context,
+            template: await this._getAnkiTemplate(options),
+            tags: options.anki.tags,
+            duplicateScope: options.anki.duplicateScope,
+            duplicateScopeCheckAllModels: options.anki.duplicateScopeCheckAllModels,
+            resultOutputMode: options.general.resultOutputMode,
+            glossaryLayoutMode: options.general.glossaryLayoutMode,
+            compactTags: options.general.compactTags,
+            requirements: [],
+            mediaOptions: {
+                audio: audioOptions,
+                screenshot: {
+                    format: options.anki.screenshot.format,
+                    quality: options.anki.screenshot.quality,
+                    contentOrigin: {tabId: null, frameId: null},
+                },
+                textParsing: {
+                    optionsContext: {index: profileIndex},
+                    scanLength: options.scanning.length,
+                },
+                popupSelectionText,
+            },
+            dictionaryStylesMap: await this._getDictionaryStylesMapDomless(options, domlessDocument),
+        };
+
+        const {note: skeletonNote, requirements} = await ankiNoteBuilder.createNote(details);
+        if (options.anki.checkForDuplicates && options.anki.duplicateBehavior === 'prevent') {
+            const [{noteIds}] = await this._invoke('getAnkiNoteInfo', {notes: [skeletonNote], fetchAdditionalInfo: false});
+            if (noteIds !== null) {
+                throw new Error('Note is a duplicate');
+            }
+        }
+        if (typeof screenshot === 'string' && requirements.some(({type}) => type === 'screenshot')) {
+            screenshotFileName = await this._injectAnkiNoteScreenshot(screenshot);
+        }
+        const {note} = await ankiNoteBuilder.createNote({...details, requirements});
+
+        const noteId = await this._invoke('addAnkiNote', {note});
+        if (noteId === null) {
+            throw new Error('Note could not be added');
+        }
+        if (options.anki.suspendNewCards) {
+            await this._invoke('suspendAnkiCardsForNote', {noteId});
+        }
+        if (options.anki.forceSync) {
+            await this._invoke('forceSync', void 0);
+        }
+        return noteId;
+    }
+
+    /**
+     * @param {string} url
+     * @returns {Promise<?string>}
+     */
+    async _injectAnkiNoteScreenshot(url) {
+        let mediaType;
+        let data;
+        if (url.startsWith('data:')) {
+            ({mediaType, data} = getDataUrlInfo(url));
+        } else {
+            const response = await fetch(url);
+            mediaType = response.headers.get('content-type') ?? '';
+            data = arrayBufferToBase64(await response.arrayBuffer());
+        }
+        const extension = getFileExtensionFromImageMediaType(mediaType);
+        if (extension === null) {
+            throw new Error('Unknown media type for screenshot image');
+        }
+        const fileName = generateAnkiNoteMediaFileName('yomitan_browser_screenshot', extension, Date.now());
+        return await this._anki.storeMediaFile(fileName, data);
     }
 
     /**
